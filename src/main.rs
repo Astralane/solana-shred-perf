@@ -2,6 +2,7 @@ use clap::Parser;
 use log::{error, info};
 use solana_ledger::shred::{Shred, ShredId};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -39,6 +40,8 @@ struct ProcessorState {
     port0_data: HashMap<ShredId, Instant>,
     port1_data: HashMap<ShredId, Instant>,
     matched_pairs: usize,
+    port_0_last_win_count: AtomicUsize,
+    port_1_last_win_count: AtomicUsize,
     port_0_delay: Vec<Duration>,
     port_1_delay: Vec<Duration>,
 }
@@ -87,6 +90,8 @@ async fn main() -> anyhow::Result<()> {
             port0_data: HashMap::new(),
             port1_data: HashMap::new(),
             matched_pairs: 0,
+            port_0_last_win_count: AtomicUsize::new(0),
+            port_1_last_win_count: AtomicUsize::new(0),
             port_0_delay: Vec::new(),
             port_1_delay: Vec::new(),
         };
@@ -221,14 +226,30 @@ fn report_stats(state: &ProcessorState, args: &Args) {
         Duration::ZERO
     };
 
+    let new_wins_port_0 = state
+        .port_1_delay
+        .len()
+        .saturating_sub(state.port_0_last_win_count.load(Ordering::Acquire));
+    let new_wins_port_1 = state
+        .port_0_delay
+        .len()
+        .saturating_sub(state.port_0_last_win_count.load(Ordering::Acquire));
+
+    state
+        .port_0_last_win_count
+        .store(state.port_1_delay.len(), Ordering::Release);
+    state
+        .port_1_last_win_count
+        .store(new_wins_port_0, Ordering::Release);
+
     info!(
         "Stats: Port {}: {} | Port {}: {} | port 0 wins: {} | port 1 wins: {} | Avg delay port 0: {:?} | Avg delay port 1: {:?}",
         args.name_0,
         state.port0_data.len(),
         args.name_1,
         state.port1_data.len(),
-        state.port_1_delay.len(),
-        state.port_0_delay.len(),
+        new_wins_port_0,
+        new_wins_port_1,
         avg_delay_port0,
         avg_delay_port1
     );
