@@ -222,12 +222,13 @@ fn report_stats(state: &ProcessorState, args: &Args) {
     };
 
     info!(
-        "Stats: Port {}: {} | Port {}: {} | Matched: {} | Avg delay port 0: {:?} | Avg delay port 1: {:?}",
+        "Stats: Port {}: {} | Port {}: {} | port 0 wins: {} | port 1 wins: {} | Avg delay port 0: {:?} | Avg delay port 1: {:?}",
         args.name_0,
         state.port0_data.len(),
         args.name_1,
         state.port1_data.len(),
-        state.matched_pairs,
+        state.port_1_delay.len(),
+        state.port_0_delay.len(),
         avg_delay_port0,
         avg_delay_port1
     );
