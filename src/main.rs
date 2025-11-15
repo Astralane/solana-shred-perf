@@ -226,21 +226,21 @@ fn report_stats(state: &ProcessorState, args: &Args) {
         Duration::ZERO
     };
 
-    let new_wins_port_0 = state
-        .port_1_delay
-        .len()
-        .saturating_sub(state.port_0_last_win_count.load(Ordering::Acquire));
-    let new_wins_port_1 = state
-        .port_0_delay
-        .len()
-        .saturating_sub(state.port_0_last_win_count.load(Ordering::Acquire));
+    let total_wins_ports_0 = state.port_1_delay.len();
+    let total_wins_ports_1 = state.port_0_delay.len();
+
+    let new_wins_port_0 =
+        total_wins_ports_0.saturating_sub(state.port_0_last_win_count.load(Ordering::Acquire));
+    let new_wins_port_1 =
+        total_wins_ports_1.saturating_sub(state.port_1_last_win_count.load(Ordering::Acquire));
 
     state
         .port_0_last_win_count
-        .store(state.port_1_delay.len(), Ordering::Release);
+        .store(total_wins_ports_0, Ordering::Release);
+
     state
         .port_1_last_win_count
-        .store(new_wins_port_0, Ordering::Release);
+        .store(total_wins_ports_1, Ordering::Release);
 
     info!(
         "Stats: Port {}: {} | Port {}: {} | port 0 wins: {} | port 1 wins: {} | Avg delay port 0: {:?} | Avg delay port 1: {:?}",
