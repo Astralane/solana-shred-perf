@@ -155,7 +155,7 @@ fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_
                 let delay = timestamp.duration_since(*other_time);
                 state.matched_pairs += 1;
                 state.delays.push(delay);
-                info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
+                // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
             }
         }
         1 => {
@@ -167,7 +167,7 @@ fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_
                 let delay = timestamp.duration_since(*other_time);
                 state.matched_pairs += 1;
                 state.delays.push(delay);
-                info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
+                // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
             }
         }
         _ => unreachable!(),
