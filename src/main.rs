@@ -178,7 +178,7 @@ fn process_shred(
                 let delay = timestamp.duration_since(*other_time);
                 state.matched_pairs += 1;
                 state.port_0_delay.push(delay);
-                info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
+                // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
             }
         }
         1 => {
