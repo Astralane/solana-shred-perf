@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
 use clap::Parser;
-use log::{info, error};
+use log::{error, info};
 use solana_ledger::shred::{Shred, ShredId};
-use tokio::net::UdpSocket;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -39,7 +39,8 @@ struct ProcessorState {
     port0_data: HashMap<ShredId, Instant>,
     port1_data: HashMap<ShredId, Instant>,
     matched_pairs: usize,
-    delays: Vec<Duration>,
+    port_0_delay: Vec<Duration>,
+    port_1_delay: Vec<Duration>,
 }
 
 #[tokio::main]
@@ -49,8 +50,18 @@ async fn main() -> anyhow::Result<()> {
 
     let (processor_tx, mut processor_rx) = mpsc::channel(4096);
 
-    let port0_task = start_port_listener(0, args.name_0.clone().into(), args.port_0, processor_tx.clone());
-    let port1_task = start_port_listener(1, args.name_1.clone().into(), args.port_1, processor_tx.clone());
+    let port0_task = start_port_listener(
+        0,
+        args.name_0.clone().into(),
+        args.port_0,
+        processor_tx.clone(),
+    );
+    let port1_task = start_port_listener(
+        1,
+        args.name_1.clone().into(),
+        args.port_1,
+        processor_tx.clone(),
+    );
 
     let timer_task = {
         let processor_tx = processor_tx.clone();
@@ -76,12 +87,18 @@ async fn main() -> anyhow::Result<()> {
             port0_data: HashMap::new(),
             port1_data: HashMap::new(),
             matched_pairs: 0,
-            delays: Vec::new(),
+            port_0_delay: Vec::new(),
+            port_1_delay: Vec::new(),
         };
 
         while let Some(event) = processor_rx.recv().await {
             match event {
-                ProcessorEvent::ShredReceived { port_id, name,shred_id, timestamp } => {
+                ProcessorEvent::ShredReceived {
+                    port_id,
+                    name,
+                    shred_id,
+                    timestamp,
+                } => {
                     process_shred(&mut state, port_id, name, shred_id, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
@@ -144,7 +161,13 @@ fn start_port_listener(
     })
 }
 
-fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_id: ShredId, timestamp: Instant) {
+fn process_shred(
+    state: &mut ProcessorState,
+    port_id: u8,
+    name: Arc<str>,
+    shred_id: ShredId,
+    timestamp: Instant,
+) {
     match port_id {
         0 => {
             if state.port0_data.contains_key(&shred_id) {
@@ -154,8 +177,8 @@ fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_
             if let Some(other_time) = state.port1_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
                 state.matched_pairs += 1;
-                state.delays.push(delay);
-                // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
+                state.port_0_delay.push(delay);
+                info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
             }
         }
         1 => {
@@ -166,7 +189,7 @@ fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_
             if let Some(other_time) = state.port0_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
                 state.matched_pairs += 1;
-                state.delays.push(delay);
+                state.port_1_delay.push(delay);
                 // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
             }
         }
@@ -176,25 +199,36 @@ fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_
 
 fn cleanup_data(state: &mut ProcessorState, timeout: Duration) {
     let now = Instant::now();
-    state.port0_data.retain(|_, t| now.duration_since(*t) < timeout);
-    state.port1_data.retain(|_, t| now.duration_since(*t) < timeout);
+    state
+        .port0_data
+        .retain(|_, t| now.duration_since(*t) < timeout);
+    state
+        .port1_data
+        .retain(|_, t| now.duration_since(*t) < timeout);
     info!("Cleanup completed");
 }
 
 fn report_stats(state: &ProcessorState, args: &Args) {
-    let avg_delay = if !state.delays.is_empty() {
-        state.delays.iter().sum::<Duration>() / state.delays.len() as u32
+    let avg_delay_port0 = if !state.port_0_delay.is_empty() {
+        state.port_0_delay.iter().sum::<Duration>() / state.port_0_delay.len() as u32
+    } else {
+        Duration::ZERO
+    };
+
+    let avg_delay_port1 = if !state.port_1_delay.is_empty() {
+        state.port_1_delay.iter().sum::<Duration>() / state.port_1_delay.len() as u32
     } else {
         Duration::ZERO
     };
 
     info!(
-        "Stats: Port {}: {} | Port {}: {} | Matched: {} | Avg delay: {:?}",
+        "Stats: Port {}: {} | Port {}: {} | Matched: {} | Avg delay port 0: {:?} | Avg delay port 1: {:?}",
         args.name_0,
         state.port0_data.len(),
         args.name_1,
         state.port1_data.len(),
         state.matched_pairs,
-        avg_delay
+        avg_delay_port0,
+        avg_delay_port1
     );
 }
