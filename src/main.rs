@@ -88,8 +88,6 @@ async fn main() -> anyhow::Result<()> {
             port0_data: HashMap::new(),
             port1_data: HashMap::new(),
             matched_pairs: 0,
-            port_0_last_win_count: AtomicUsize::new(0),
-            port_1_last_win_count: AtomicUsize::new(0),
             port_0_delay: Vec::new(),
             port_1_delay: Vec::new(),
         };
