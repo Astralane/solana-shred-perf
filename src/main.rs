@@ -40,8 +40,6 @@ struct ProcessorState {
     port0_data: HashMap<ShredId, Instant>,
     port1_data: HashMap<ShredId, Instant>,
     matched_pairs: usize,
-    port_0_last_win_count: AtomicUsize,
-    port_1_last_win_count: AtomicUsize,
     port_0_delay: Vec<Duration>,
     port_1_delay: Vec<Duration>,
 }
@@ -107,10 +105,10 @@ async fn main() -> anyhow::Result<()> {
                     process_shred(&mut state, port_id, name, shred_id, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
-                    cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
+                    // cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
                 }
                 ProcessorEvent::StatsTick => {
-                    report_stats(&state, &args);
+                    report_stats(&mut state, &args);
                 }
             }
         }
@@ -213,7 +211,7 @@ fn cleanup_data(state: &mut ProcessorState, timeout: Duration) {
     info!("Cleanup completed");
 }
 
-fn report_stats(state: &ProcessorState, args: &Args) {
+fn report_stats(state: &mut ProcessorState, args: &Args) {
     let avg_delay_port0 = if !state.port_0_delay.is_empty() {
         state.port_0_delay.iter().sum::<Duration>() / state.port_0_delay.len() as u32
     } else {
@@ -229,28 +227,18 @@ fn report_stats(state: &ProcessorState, args: &Args) {
     let total_wins_ports_0 = state.port_1_delay.len();
     let total_wins_ports_1 = state.port_0_delay.len();
 
-    let new_wins_port_0 =
-        total_wins_ports_0.saturating_sub(state.port_0_last_win_count.load(Ordering::Acquire));
-    let new_wins_port_1 =
-        total_wins_ports_1.saturating_sub(state.port_1_last_win_count.load(Ordering::Acquire));
-
-    state
-        .port_0_last_win_count
-        .store(total_wins_ports_0, Ordering::Release);
-
-    state
-        .port_1_last_win_count
-        .store(total_wins_ports_1, Ordering::Release);
-
     info!(
         "Stats: Port {}: {} | Port {}: {} | port 0 wins: {} | port 1 wins: {} | Avg delay port 0: {:?} | Avg delay port 1: {:?}",
         args.name_0,
         state.port0_data.len(),
         args.name_1,
         state.port1_data.len(),
-        new_wins_port_0,
-        new_wins_port_1,
+        total_wins_ports_0,
+        total_wins_ports_1,
         avg_delay_port0,
         avg_delay_port1
     );
+    //cleanup
+    state.port_0_delay.clear();
+    state.port_1_delay.clear();
 }
