@@ -250,6 +250,22 @@ fn report_stats(state: &mut ProcessorState, args: &Args) {
         avg_delay_port0,
         avg_delay_port1
     );
+
+    //check if anything in port 0 is missing from port 1
+    let mut missing_from_port_1 = 0;
+    let mut missing_from_port_0 = 0;
+    for (id, (_, _)) in &state.port0_data {
+        if !state.port1_data.contains_key(id) {
+            missing_from_port_1 += 1;
+        }
+    }
+
+    for (id, (_, _)) in &state.port1_data {
+        if !state.port0_data.contains_key(id) {
+            missing_from_port_0 += 1;
+        }
+    }
+    info!("Missing from port 0: {} | Missing from port 1: {}", missing_from_port_0, missing_from_port_1);
     //cleanup
     state.port_0_delay.clear();
     state.port_1_delay.clear();
