@@ -269,6 +269,8 @@ fn report_stats(state: &mut ProcessorState, args: &Args) {
     //cleanup
     state.port_0_delay.clear();
     state.port_1_delay.clear();
+    state.port0_data.clear();
+    state.port1_data.clear();
 }
 
 fn get_payload(shred: &Shred) -> &[u8] {
