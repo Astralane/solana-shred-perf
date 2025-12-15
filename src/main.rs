@@ -1,6 +1,6 @@
 use clap::Parser;
 use log::{error, info};
-use solana_ledger::shred::{Shred, ShredId};
+use solana_ledger::shred::{Payload, Shred, ShredId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -31,14 +31,15 @@ enum ProcessorEvent {
         name: Arc<str>,
         shred_id: ShredId,
         timestamp: Instant,
+        data: Shred,
     },
     Cleanup,
     StatsTick,
 }
 
 struct ProcessorState {
-    port0_data: HashMap<ShredId, Instant>,
-    port1_data: HashMap<ShredId, Instant>,
+    port0_data: HashMap<ShredId, (Instant, Shred)>,
+    port1_data: HashMap<ShredId, (Instant, Shred)>,
     matched_pairs: usize,
     port_0_delay: Vec<Duration>,
     port_1_delay: Vec<Duration>,
@@ -99,8 +100,9 @@ async fn main() -> anyhow::Result<()> {
                     name,
                     shred_id,
                     timestamp,
+                    data,
                 } => {
-                    process_shred(&mut state, port_id, name, shred_id, timestamp);
+                    process_shred(&mut state, port_id, name, shred_id, data, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
                     // cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
@@ -150,6 +152,7 @@ fn start_port_listener(
                             name: Arc::clone(&name),
                             shred_id: shred.id(),
                             timestamp: Instant::now(),
+                            data: shred,
                         };
                         if let Err(e) = sender.send(event).await {
                             error!("[{}] Failed to send event: {}", name, e);
@@ -167,6 +170,7 @@ fn process_shred(
     port_id: u8,
     name: Arc<str>,
     shred_id: ShredId,
+    shred: Shred,
     timestamp: Instant,
 ) {
     match port_id {
@@ -174,9 +178,14 @@ fn process_shred(
             if state.port0_data.contains_key(&shred_id) {
                 return;
             }
-            state.port0_data.insert(shred_id.clone(), timestamp);
-            if let Some(other_time) = state.port1_data.get(&shred_id) {
+            state
+                .port0_data
+                .insert(shred_id.clone(), (timestamp, shred.clone()));
+            if let Some((other_time, other_shred)) = state.port1_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
+                if other_shred != &shred {
+                    error!("invalid shred payload (got first in port 1)")
+                }
                 state.matched_pairs += 1;
                 state.port_0_delay.push(delay);
                 // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
@@ -186,9 +195,14 @@ fn process_shred(
             if state.port1_data.contains_key(&shred_id) {
                 return;
             }
-            state.port1_data.insert(shred_id.clone(), timestamp);
-            if let Some(other_time) = state.port0_data.get(&shred_id) {
+            state
+                .port1_data
+                .insert(shred_id.clone(), (timestamp, shred.clone()));
+            if let Some((other_time, other_shred)) = state.port0_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
+                if other_shred != &shred {
+                    error!("invalid shred payload (got first in port 0)")
+                }
                 state.matched_pairs += 1;
                 state.port_1_delay.push(delay);
                 // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
@@ -202,10 +216,10 @@ fn cleanup_data(state: &mut ProcessorState, timeout: Duration) {
     let now = Instant::now();
     state
         .port0_data
-        .retain(|_, t| now.duration_since(*t) < timeout);
+        .retain(|_, (t, _)| now.duration_since(*t) < timeout);
     state
         .port1_data
-        .retain(|_, t| now.duration_since(*t) < timeout);
+        .retain(|_, (t, _)| now.duration_since(*t) < timeout);
     info!("Cleanup completed");
 }
 
