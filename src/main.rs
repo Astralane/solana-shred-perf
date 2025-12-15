@@ -183,7 +183,7 @@ fn process_shred(
                 .insert(shred_id.clone(), (timestamp, shred.clone()));
             if let Some((other_time, other_shred)) = state.port1_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
-                if !other_shred.is_shred_duplicate(&shred) {
+                if other_shred.is_shred_duplicate(&shred) {
                     error!("same shred id but not duplicate (got first in port 1)")
                 }
                 state.matched_pairs += 1;
@@ -200,7 +200,7 @@ fn process_shred(
                 .insert(shred_id.clone(), (timestamp, shred.clone()));
             if let Some((other_time, other_shred)) = state.port0_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
-                if !other_shred.is_shred_duplicate(&shred) {
+                if other_shred.is_shred_duplicate(&shred) {
                     error!("same shred id but not duplicate (got first in port 0)")
                 }
                 state.matched_pairs += 1;
