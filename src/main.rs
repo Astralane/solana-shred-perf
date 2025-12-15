@@ -1,7 +1,6 @@
 use clap::Parser;
 use log::{error, info};
-use solana_ledger::shred::shred_code::ShredCode;
-use solana_ledger::shred::{Error, Payload, Shred, ShredData, ShredId};
+use solana_ledger::shred::{Shred, ShredId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
