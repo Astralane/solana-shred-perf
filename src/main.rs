@@ -184,7 +184,7 @@ fn process_shred(
             if let Some((other_time, other_shred)) = state.port1_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
                 if !other_shred.is_shred_duplicate(&shred) {
-                    error!("same shred id but not duplicate (got first in port 0)")
+                    error!("same shred id but not duplicate (got first in port 1)")
                 }
                 state.matched_pairs += 1;
                 state.port_0_delay.push(delay);
