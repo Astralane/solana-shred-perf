@@ -1,6 +1,7 @@
 use clap::Parser;
 use log::{error, info};
-use solana_ledger::shred::{Payload, Shred, ShredId};
+use solana_ledger::shred::shred_code::ShredCode;
+use solana_ledger::shred::{Error, Payload, Shred, ShredData, ShredId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -183,7 +184,7 @@ fn process_shred(
                 .insert(shred_id.clone(), (timestamp, shred.clone()));
             if let Some((other_time, other_shred)) = state.port1_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
-                if other_shred.is_shred_duplicate(&shred) {
+                if get_payload(&other_shred) != get_payload(&shred) {
                     error!("same shred id but not duplicate (got first in port 1)")
                 }
                 state.matched_pairs += 1;
@@ -200,7 +201,7 @@ fn process_shred(
                 .insert(shred_id.clone(), (timestamp, shred.clone()));
             if let Some((other_time, other_shred)) = state.port0_data.get(&shred_id) {
                 let delay = timestamp.duration_since(*other_time);
-                if other_shred.is_shred_duplicate(&shred) {
+                if get_payload(&other_shred) != get_payload(&shred) {
                     error!("same shred id but not duplicate (got first in port 0)")
                 }
                 state.matched_pairs += 1;
@@ -253,4 +254,16 @@ fn report_stats(state: &mut ProcessorState, args: &Args) {
     //cleanup
     state.port_0_delay.clear();
     state.port_1_delay.clear();
+}
+
+fn get_payload(shred: &Shred) -> &[u8] {
+    let Ok(offset) = shred.retransmitter_signature_offset() else {
+        return shred.payload();
+    };
+    // Assert that the retransmitter's signature is at the very end of
+    // the shred payload.
+    shred
+        .payload()
+        .get(..offset)
+        .unwrap_or_else(|| shred.payload())
 }
