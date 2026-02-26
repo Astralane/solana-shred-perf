@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
                     if slot > state.highest_slot.load(Ordering::Relaxed) {
                         state.highest_slot.store(slot, Ordering::Relaxed);
                     }
-                    if slot.saturating_sub(10) < state.highest_slot.load(Ordering::Relaxed) {
+                    if slot < state.highest_slot.load(Ordering::Relaxed).saturating_sub(10) {
                         warn!(
                             "skipping, provider sent data 10 slots behind, provider {} highest slot {}, slot recvd {}",
                             provider.name, state.highest_slot.load(Ordering::Relaxed), slot
