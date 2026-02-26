@@ -1,9 +1,13 @@
+mod leader_schedule_cache;
+
+use crate::leader_schedule_cache::fetch_leader_schedule_cache;
 use clap::Parser;
 use csv::Writer;
 use futures_util::future::join_all;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use solana_ledger::shred::{Shred, ShredId, ShredType};
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use std::collections::HashSet;
 use std::fs::read_to_string;
 use std::io;
@@ -23,6 +27,7 @@ pub struct Provider {
 #[derive(Deserialize, Debug)]
 struct Config {
     pub providers: Vec<Provider>,
+    pub rpc_url: String,
     pub timeout_secs: u64,
 }
 #[derive(Parser, Debug)]
@@ -65,13 +70,15 @@ async fn main() -> anyhow::Result<()> {
         let now = chrono::Local::now();
         format!("report_{}.csv", now.format("%m_%d_%H_%M_%S"))
     };
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(&csv_file_name)?;
 
     let config: Config = serde_json::from_str(&config_file)?;
+    let rpc = RpcClient::new(config.rpc_url);
+    let leader_schedule_cache = fetch_leader_schedule_cache(&rpc).await?;
     let mut wtr = csv::Writer::from_writer(file);
 
     let (processor_tx, mut processor_rx) = mpsc::channel(4096);
@@ -116,6 +123,16 @@ async fn main() -> anyhow::Result<()> {
                     timestamp,
                     data,
                 } => {
+                    let leader = leader_schedule_cache
+                        .get(&slot)
+                        .expect("slot not in schedule");
+                    
+                    if !data.verify(leader) {
+                        warn!(
+                            "cannot verify shreds given by provider {:?} for {slot} {leader:?}",
+                            provider.name
+                        )
+                    }
                     if dedup.contains(&(provider.port, shred_id)) {
                         continue;
                     }
