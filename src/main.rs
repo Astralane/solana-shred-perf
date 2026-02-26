@@ -8,11 +8,11 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use solana_ledger::shred::{Shred, ShredId, ShredType};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::read_to_string;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -53,6 +53,7 @@ enum ProcessorEvent {
 
 #[derive(Default)]
 struct ProcessorState {
+    data: HashMap<u16, HashMap<u64, HashMap<ShredId, SystemTime>>>,
     highest_slot: Arc<AtomicU64>,
 }
 
@@ -139,14 +140,19 @@ async fn main() -> anyhow::Result<()> {
                     if slot > state.highest_slot.load(Ordering::Relaxed) {
                         state.highest_slot.store(slot, Ordering::Relaxed);
                     }
-                    if slot < state.highest_slot.load(Ordering::Relaxed).saturating_sub(10) {
+                    if slot
+                        < state
+                            .highest_slot
+                            .load(Ordering::Relaxed)
+                            .saturating_sub(10)
+                    {
                         warn!(
                             "skipping, provider sent data 10 slots behind, provider {} highest slot {}, slot recvd {}",
                             provider.name, state.highest_slot.load(Ordering::Relaxed), slot
                         );
                         continue;
                     }
-                    process_shred(&mut wtr, &provider, data, timestamp);
+                    process_shred(&mut state, &mut wtr, &provider, data, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
                     wtr.flush().unwrap();
@@ -220,11 +226,20 @@ struct Record {
 }
 
 fn process_shred<T: io::Write>(
+    state: &mut ProcessorState,
     writer: &mut Writer<T>,
     provider: &Arc<Provider>,
     shred: Shred,
     timestamp: SystemTime,
 ) {
+    state
+        .data
+        .entry(provider.port)
+        .or_default()
+        .entry(shred.slot())
+        .or_default()
+        .insert(shred.id(), timestamp);
+
     writer
         .serialize(Record {
             name: provider.name.clone(),
@@ -247,4 +262,50 @@ fn get_payload(shred: &Shred) -> &[u8] {
         .payload()
         .get(..offset)
         .unwrap_or_else(|| shred.payload())
+}
+
+fn print_avg_time_diff(data: &HashMap<Provider, HashMap<u64, HashMap<ShredId, SystemTime>>>) {
+    // slot -> provider -> list of timestamps
+    let mut slot_provider_times: HashMap<u64, HashMap<u16, Vec<SystemTime>>> = HashMap::new();
+
+    for (provider, slots) in data {
+        for (slot, shreds) in slots {
+            for timestamp in shreds.values() {
+                slot_provider_times
+                    .entry(*slot)
+                    .or_default()
+                    .entry(provider.port)
+                    .or_default()
+                    .push(*timestamp);
+            }
+        }
+    }
+
+    for (slot, providers) in &slot_provider_times {
+        // compute avg timestamp per provider
+        let avg_times: Vec<(u16, Duration)> = providers
+            .iter()
+            .map(|(provider_port, timestamps)| {
+                let avg = timestamps
+                    .iter()
+                    .map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default())
+                    .sum::<Duration>()
+                    / timestamps.len() as u32;
+                (*provider_port, avg)
+            })
+            .collect();
+
+        // print diff between each pair of providers
+        for i in 0..avg_times.len() {
+            for j in (i + 1)..avg_times.len() {
+                let (p1, t1) = &avg_times[i];
+                let (p2, t2) = &avg_times[j];
+                let diff = if t1 > t2 { *t1 - *t2 } else { *t2 - *t1 };
+                info!(
+                    "slot={} | port {} vs port {} | avg diff = {:?}",
+                    slot, p1, p2, diff
+                );
+            }
+        }
+    }
 }
