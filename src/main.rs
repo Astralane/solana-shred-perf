@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (processor_tx, mut processor_rx) = mpsc::channel(4096);
 
+    let primary_provider = config.providers[0].clone();
     let mut tasks = Vec::with_capacity(config.providers.len());
     for provider in config.providers {
         let provider_c = Arc::new(provider);
@@ -155,12 +156,13 @@ async fn main() -> anyhow::Result<()> {
                     process_shred(&mut state, &mut wtr, &provider, data, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
-                    wtr.flush().unwrap();
+                    // wtr.flush().unwrap();
                     // cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
                 }
                 ProcessorEvent::StatsTick => {
-                    print_avg_time_diff(&state.data);
-                    //
+                    print_shred_coverage(primary_provider.port, &state.data);
+                    print_avg_time_diff(primary_provider.port, &state.data);
+                    info!("------");
                 }
             }
         }
@@ -240,17 +242,16 @@ fn process_shred<T: io::Write>(
         .entry(shred.slot())
         .or_default()
         .insert(shred.id(), timestamp);
-
-    writer
-        .serialize(Record {
-            name: provider.name.clone(),
-            port: provider.port,
-            slot: shred.slot(),
-            shred_index: shred.index(),
-            shred_type: ShredType::Data,
-            ts: timestamp.duration_since(UNIX_EPOCH).unwrap().as_micros() as u64,
-        })
-        .unwrap();
+    // writer
+    //     .serialize(Record {
+    //         name: provider.name.clone(),
+    //         port: provider.port,
+    //         slot: shred.slot(),
+    //         shred_index: shred.index(),
+    //         shred_type: ShredType::Data,
+    //         ts: timestamp.duration_since(UNIX_EPOCH).unwrap().as_micros() as u64,
+    //     })
+    //     .unwrap();
 }
 
 fn get_payload(shred: &Shred) -> &[u8] {
@@ -265,48 +266,125 @@ fn get_payload(shred: &Shred) -> &[u8] {
         .unwrap_or_else(|| shred.payload())
 }
 
-fn print_avg_time_diff(data: &HashMap<u16, HashMap<u64, HashMap<ShredId, SystemTime>>>) {
-    // slot -> provider -> list of timestamps
-    let mut slot_provider_times: HashMap<u64, HashMap<u16, Vec<SystemTime>>> = HashMap::new();
+fn print_avg_time_diff(
+    primary_port: u16,
+    data: &HashMap<u16, HashMap<u64, HashMap<ShredId, SystemTime>>>,
+) {
+    let all_slots: std::collections::HashSet<u64> = data
+        .values()
+        .flat_map(|slots| slots.keys().copied())
+        .collect();
 
-    for (port, slots) in data {
-        for (slot, shreds) in slots {
-            for timestamp in shreds.values() {
-                slot_provider_times
-                    .entry(*slot)
-                    .or_default()
-                    .entry(*port)
-                    .or_default()
-                    .push(*timestamp);
+    let primary_slots = match data.get(&primary_port) {
+        Some(s) => s,
+        None => {
+            error!("primary port {} not found", primary_port);
+            return;
+        }
+    };
+
+    for slot in &all_slots {
+        let primary_shreds = match primary_slots.get(slot) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        for (port, slots) in data {
+            if *port == primary_port {
+                continue;
             }
+
+            let Some(other_shreds) = slots.get(slot) else {
+                continue;
+            };
+
+            let mut win_diffs: Vec<Duration> = Vec::new();
+            let mut lose_diffs: Vec<Duration> = Vec::new();
+
+            for (shred_id, primary_ts) in primary_shreds {
+                let Some(other_ts) = other_shreds.get(shred_id) else {
+                    continue;
+                };
+
+                if primary_ts <= other_ts {
+                    // primary arrived first (wins)
+                    if let Ok(diff) = other_ts.duration_since(*primary_ts) {
+                        win_diffs.push(diff);
+                    }
+                } else {
+                    // primary arrived later (loses)
+                    if let Ok(diff) = primary_ts.duration_since(*other_ts) {
+                        lose_diffs.push(diff);
+                    }
+                }
+            }
+
+            let avg_win = if !win_diffs.is_empty() {
+                win_diffs.iter().sum::<Duration>() / win_diffs.len() as u32
+            } else {
+                Duration::ZERO
+            };
+
+            let avg_lose = if !lose_diffs.is_empty() {
+                lose_diffs.iter().sum::<Duration>() / lose_diffs.len() as u32
+            } else {
+                Duration::ZERO
+            };
+
+            info!(
+                "slot={} | port {} vs port {} | wins={} avg_win={:?} | losses={} avg_loss={:?}",
+                slot,
+                primary_port,
+                port,
+                win_diffs.len(),
+                avg_win,
+                lose_diffs.len(),
+                avg_lose,
+            );
         }
     }
+}
 
-    for (slot, providers) in &slot_provider_times {
-        // compute avg timestamp per provider
-        let avg_times: Vec<(u16, Duration)> = providers
-            .iter()
-            .map(|(provider_port, timestamps)| {
-                let avg = timestamps
-                    .iter()
-                    .map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default())
-                    .sum::<Duration>()
-                    / timestamps.len() as u32;
-                (*provider_port, avg)
-            })
-            .collect();
+fn print_shred_coverage(
+    primary_port: u16,
+    data: &HashMap<u16, HashMap<u64, HashMap<ShredId, SystemTime>>>,
+) {
+    let all_slots: std::collections::HashSet<u64> = data
+        .values()
+        .flat_map(|slots| slots.keys().copied())
+        .collect();
 
-        // print diff between each pair of providers
-        for i in 0..avg_times.len() {
-            for j in (i + 1)..avg_times.len() {
-                let (p1, t1) = &avg_times[i];
-                let (p2, t2) = &avg_times[j];
-                let diff = if t1 > t2 { *t1 - *t2 } else { *t2 - *t1 };
-                info!(
-                    "slot={} | port {} vs port {} | avg diff = {:?}",
-                    slot, p1, p2, diff
-                );
+    let primary_slots = data.get(&primary_port);
+
+    for slot in &all_slots {
+        let primary_shreds: std::collections::HashSet<&ShredId> = primary_slots
+            .and_then(|s| s.get(slot))
+            .map(|s| s.keys().collect())
+            .unwrap_or_default();
+
+        for (port, slots) in data {
+            if *port == primary_port {
+                continue;
             }
+
+            let other_shreds: std::collections::HashSet<&ShredId> = slots
+                .get(slot)
+                .map(|s| s.keys().collect())
+                .unwrap_or_default();
+
+            // primary saw it, other didn't
+            let only_primary: Vec<&&ShredId> = primary_shreds.difference(&other_shreds).collect();
+            // other saw it, primary didn't
+            let only_other: Vec<&&ShredId> = other_shreds.difference(&primary_shreds).collect();
+
+            info!(
+                "slot={} | port {} vs port {} | only_primary={} | only_other={}",
+                slot,
+                primary_port,
+                port,
+                only_primary.len(),
+                only_other.len(),
+            );
         }
     }
 }
