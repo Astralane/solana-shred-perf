@@ -29,14 +29,13 @@ struct Config {
     pub providers: Vec<Provider>,
     pub rpc_url: String,
     pub timeout_secs: u64,
+    pub csv_file: Option<String>,
 }
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
     #[clap(short, long)]
     config: String,
-    #[clap(short, long)]
-    csv_file: Option<String>,
 }
 
 #[derive(Debug)]
@@ -63,8 +62,12 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config_file: String = read_to_string(args.config)?;
 
+    let config: Config = serde_json::from_str(&config_file)?;
+    let rpc = RpcClient::new(config.rpc_url);
+    let leader_schedule_cache = fetch_leader_schedule_cache(&rpc).await?;
+
     //create a file from args. csv_file name if exits or create a file with name report_mm_dd_hh_mm_ss format
-    let csv_file_name = if let Some(ref name) = args.csv_file {
+    let csv_file_name = if let Some(ref name) = config.csv_file {
         name.clone()
     } else {
         let now = chrono::Local::now();
@@ -75,10 +78,6 @@ async fn main() -> anyhow::Result<()> {
         .create(true)
         .truncate(true)
         .open(&csv_file_name)?;
-
-    let config: Config = serde_json::from_str(&config_file)?;
-    let rpc = RpcClient::new(config.rpc_url);
-    let leader_schedule_cache = fetch_leader_schedule_cache(&rpc).await?;
     let mut wtr = csv::Writer::from_writer(file);
 
     let (processor_tx, mut processor_rx) = mpsc::channel(4096);
@@ -126,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
                     let leader = leader_schedule_cache
                         .get(&slot)
                         .expect("slot not in schedule");
-                    
+
                     if !data.verify(leader) {
                         warn!(
                             "cannot verify shreds given by provider {:?} for {slot} {leader:?}",
