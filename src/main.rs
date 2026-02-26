@@ -1,74 +1,91 @@
 use clap::Parser;
-use log::{error, info};
-use solana_ledger::shred::{Shred, ShredId};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use csv::Writer;
+use futures_util::future::join_all;
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
+use solana_ledger::shred::{Shred, ShredId, ShredType};
+use std::collections::HashSet;
+use std::fs::read_to_string;
+use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
 
+#[derive(Debug, Clone, Deserialize, Hash)]
+pub struct Provider {
+    pub name: String,
+    pub port: u16,
+}
+
+#[derive(Deserialize, Debug)]
+struct Config {
+    pub providers: Vec<Provider>,
+    pub timeout_secs: u64,
+}
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    #[clap(long)]
-    pub name_0: String,
-    #[clap(long)]
-    pub port_0: u16,
     #[clap(short, long)]
-    pub name_1: String,
+    config: String,
     #[clap(short, long)]
-    pub port_1: u16,
-    #[clap(long, default_value = "60")]
-    pub timeout_secs: u64,
+    csv_file: Option<String>,
 }
 
 #[derive(Debug)]
 enum ProcessorEvent {
     ShredReceived {
-        port_id: u8,
-        name: Arc<str>,
+        slot: u64,
+        provider: Arc<Provider>,
         shred_id: ShredId,
-        timestamp: Instant,
+        timestamp: SystemTime,
         data: Shred,
     },
     Cleanup,
     StatsTick,
 }
 
+#[derive(Default)]
 struct ProcessorState {
-    port0_data: HashMap<ShredId, (Instant, Shred)>,
-    port1_data: HashMap<ShredId, (Instant, Shred)>,
-    matched_pairs: usize,
-    port_0_delay: Vec<Duration>,
-    port_1_delay: Vec<Duration>,
+    highest_slot: Arc<AtomicU64>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     pretty_env_logger::init();
     let args = Args::parse();
+    let config_file: String = read_to_string(args.config)?;
+
+    //create a file from args. csv_file name if exits or create a file with name report_mm_dd_hh_mm_ss format
+    let csv_file_name = if let Some(ref name) = args.csv_file {
+        name.clone()
+    } else {
+        let now = chrono::Local::now();
+        format!("report_{}.csv", now.format("%m_%d_%H_%M_%S"))
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&csv_file_name)?;
+
+    let config: Config = serde_json::from_str(&config_file)?;
+    let mut wtr = csv::Writer::from_writer(file);
 
     let (processor_tx, mut processor_rx) = mpsc::channel(4096);
 
-    let port0_task = start_port_listener(
-        0,
-        args.name_0.clone().into(),
-        args.port_0,
-        processor_tx.clone(),
-    );
-    let port1_task = start_port_listener(
-        1,
-        args.name_1.clone().into(),
-        args.port_1,
-        processor_tx.clone(),
-    );
-
+    let mut tasks = Vec::with_capacity(config.providers.len());
+    for provider in config.providers {
+        let provider_c = Arc::new(provider);
+        tasks.push(start_port_listener(provider_c, processor_tx.clone()))
+    }
+    let listener_tasks = join_all(tasks);
     let timer_task = {
         let processor_tx = processor_tx.clone();
         tokio::spawn(async move {
-            let mut cleanup_interval = time::interval(Duration::from_secs(args.timeout_secs));
+            let mut cleanup_interval = time::interval(Duration::from_secs(config.timeout_secs));
             let mut stats_interval = time::interval(Duration::from_secs(10));
 
             loop {
@@ -86,37 +103,47 @@ async fn main() -> anyhow::Result<()> {
 
     let processor_task = tokio::spawn(async move {
         let mut state = ProcessorState {
-            port0_data: HashMap::new(),
-            port1_data: HashMap::new(),
-            matched_pairs: 0,
-            port_0_delay: Vec::new(),
-            port_1_delay: Vec::new(),
+            ..Default::default()
         };
 
         while let Some(event) = processor_rx.recv().await {
+            let mut dedup: HashSet<(u16, ShredId)> = HashSet::new();
             match event {
                 ProcessorEvent::ShredReceived {
-                    port_id,
-                    name,
+                    slot,
+                    provider,
                     shred_id,
                     timestamp,
                     data,
                 } => {
-                    process_shred(&mut state, port_id, name, shred_id, data, timestamp);
+                    if dedup.contains(&(provider.port, shred_id)) {
+                        continue;
+                    }
+                    dedup.insert((provider.port, shred_id));
+                    if slot > state.highest_slot.load(Ordering::Relaxed) {
+                        state.highest_slot.store(slot, Ordering::Relaxed);
+                    }
+                    if slot.saturating_sub(10) < state.highest_slot.load(Ordering::Relaxed) {
+                        warn!(
+                            "skipping, provider sent data 10 slots behind {}",
+                            provider.name
+                        );
+                        continue;
+                    }
+                    process_shred(&mut wtr, &provider, data, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
                     // cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
                 }
                 ProcessorEvent::StatsTick => {
-                    report_stats(&mut state, &args);
+                    //
                 }
             }
         }
     });
 
     tokio::select! {
-        _ = port0_task => {},
-        _ = port1_task => {},
+        _ = listener_tasks => {},
         _ = processor_task => {},
         _ = timer_task => {},
         _ = tokio::signal::ctrl_c() => info!("Shutting down..."),
@@ -126,20 +153,19 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn start_port_listener(
-    port_id: u8,
-    name: Arc<str>,
-    port: u16,
+    provider: Arc<Provider>,
     sender: mpsc::Sender<ProcessorEvent>,
 ) -> tokio::task::JoinHandle<()> {
+    let port = provider.port;
     tokio::spawn(async move {
         let socket = match UdpSocket::bind(format!("0.0.0.0:{}", port)).await {
             Ok(s) => s,
             Err(e) => {
-                error!("[{}] Failed to bind port {}: {}", name, port, e);
+                error!("[{}] Failed to bind port {}: {}", provider.name, port, e);
                 return;
             }
         };
-        info!("[{}] Listening on port {}", name, port);
+        info!("[{}] Listening on port {}", provider.name, port);
 
         let mut buf = [0u8; 2048];
         loop {
@@ -147,130 +173,51 @@ fn start_port_listener(
                 Ok((size, _)) => {
                     let data = buf[..size].to_vec();
                     if let Ok(shred) = Shred::new_from_serialized_shred(data) {
+                        let slot = shred.slot() as u64;
                         let event = ProcessorEvent::ShredReceived {
-                            port_id,
-                            name: Arc::clone(&name),
+                            slot,
+                            provider: provider.clone(),
                             shred_id: shred.id(),
-                            timestamp: Instant::now(),
+                            timestamp: SystemTime::now(),
                             data: shred,
                         };
                         if let Err(e) = sender.send(event).await {
-                            error!("[{}] Failed to send event: {}", name, e);
+                            error!("[{}] Failed to send event: {}", provider.name, e);
                         }
                     }
                 }
-                Err(e) => error!("[{}] Receive error: {}", name, e),
+                Err(e) => error!("[{}] Receive error: {}", provider.name, e),
             }
         }
     })
 }
 
-fn process_shred(
-    state: &mut ProcessorState,
-    port_id: u8,
-    name: Arc<str>,
-    shred_id: ShredId,
+#[derive(Debug, Serialize)]
+struct Record {
+    name: String,
+    port: u16,
+    slot: u64,
+    shred_index: u32,
+    shred_type: ShredType,
+    ts: u64,
+}
+
+fn process_shred<T: io::Write>(
+    writer: &mut Writer<T>,
+    provider: &Arc<Provider>,
     shred: Shred,
-    timestamp: Instant,
+    timestamp: SystemTime,
 ) {
-    match port_id {
-        0 => {
-            if state.port0_data.contains_key(&shred_id) {
-                return;
-            }
-            state
-                .port0_data
-                .insert(shred_id.clone(), (timestamp, shred.clone()));
-            if let Some((other_time, other_shred)) = state.port1_data.get(&shred_id) {
-                let delay = timestamp.duration_since(*other_time);
-                if get_payload(&other_shred) != get_payload(&shred) {
-                    error!("same shred id but not duplicate (got first in port 1)")
-                }
-                state.matched_pairs += 1;
-                state.port_0_delay.push(delay);
-                // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
-            }
-        }
-        1 => {
-            if state.port1_data.contains_key(&shred_id) {
-                return;
-            }
-            state
-                .port1_data
-                .insert(shred_id.clone(), (timestamp, shred.clone()));
-            if let Some((other_time, other_shred)) = state.port0_data.get(&shred_id) {
-                let delay = timestamp.duration_since(*other_time);
-                if get_payload(&other_shred) != get_payload(&shred) {
-                    error!("same shred id but not duplicate (got first in port 0)")
-                }
-                state.matched_pairs += 1;
-                state.port_1_delay.push(delay);
-                // info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
-            }
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn cleanup_data(state: &mut ProcessorState, timeout: Duration) {
-    let now = Instant::now();
-    state
-        .port0_data
-        .retain(|_, (t, _)| now.duration_since(*t) < timeout);
-    state
-        .port1_data
-        .retain(|_, (t, _)| now.duration_since(*t) < timeout);
-    info!("Cleanup completed");
-}
-
-fn report_stats(state: &mut ProcessorState, args: &Args) {
-    let avg_delay_port0 = if !state.port_0_delay.is_empty() {
-        state.port_0_delay.iter().sum::<Duration>() / state.port_0_delay.len() as u32
-    } else {
-        Duration::ZERO
-    };
-
-    let avg_delay_port1 = if !state.port_1_delay.is_empty() {
-        state.port_1_delay.iter().sum::<Duration>() / state.port_1_delay.len() as u32
-    } else {
-        Duration::ZERO
-    };
-
-    let total_wins_ports_0 = state.port_1_delay.len();
-    let total_wins_ports_1 = state.port_0_delay.len();
-
-    info!(
-        "Stats: Port {}: {} | Port {}: {} | port 0 wins: {} | port 1 wins: {} | Avg delay port 0: {:?} | Avg delay port 1: {:?}",
-        args.name_0,
-        state.port0_data.len(),
-        args.name_1,
-        state.port1_data.len(),
-        total_wins_ports_0,
-        total_wins_ports_1,
-        avg_delay_port0,
-        avg_delay_port1
-    );
-
-    //check if anything in port 0 is missing from port 1
-    let mut missing_from_port_1 = 0;
-    let mut missing_from_port_0 = 0;
-    for (id, (_, _)) in &state.port0_data {
-        if !state.port1_data.contains_key(id) {
-            missing_from_port_1 += 1;
-        }
-    }
-
-    for (id, (_, _)) in &state.port1_data {
-        if !state.port0_data.contains_key(id) {
-            missing_from_port_0 += 1;
-        }
-    }
-    info!("Missing from port 0: {} | Missing from port 1: {}", missing_from_port_0, missing_from_port_1);
-    //cleanup
-    state.port_0_delay.clear();
-    state.port_1_delay.clear();
-    state.port0_data.clear();
-    state.port1_data.clear();
+    writer
+        .serialize(Record {
+            name: provider.name.clone(),
+            port: provider.port,
+            slot: shred.slot(),
+            shred_index: shred.index(),
+            shred_type: ShredType::Data,
+            ts: timestamp.duration_since(UNIX_EPOCH).unwrap().as_micros() as u64,
+        })
+        .unwrap();
 }
 
 fn get_payload(shred: &Shred) -> &[u8] {
