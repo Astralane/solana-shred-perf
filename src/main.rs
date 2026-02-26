@@ -141,14 +141,15 @@ async fn main() -> anyhow::Result<()> {
                     }
                     if slot.saturating_sub(10) < state.highest_slot.load(Ordering::Relaxed) {
                         warn!(
-                            "skipping, provider sent data 10 slots behind {}",
-                            provider.name
+                            "skipping, provider sent data 10 slots behind, provider {} highest slot {}, slot recvd {}",
+                            provider.name, state.highest_slot.load(Ordering::Relaxed), slot
                         );
                         continue;
                     }
                     process_shred(&mut wtr, &provider, data, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
+                    wtr.flush().unwrap();
                     // cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
                 }
                 ProcessorEvent::StatsTick => {
