@@ -159,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
                     // cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
                 }
                 ProcessorEvent::StatsTick => {
+                    print_avg_time_diff(&state.data);
                     //
                 }
             }
@@ -264,17 +265,17 @@ fn get_payload(shred: &Shred) -> &[u8] {
         .unwrap_or_else(|| shred.payload())
 }
 
-fn print_avg_time_diff(data: &HashMap<Provider, HashMap<u64, HashMap<ShredId, SystemTime>>>) {
+fn print_avg_time_diff(data: &HashMap<u16, HashMap<u64, HashMap<ShredId, SystemTime>>>) {
     // slot -> provider -> list of timestamps
     let mut slot_provider_times: HashMap<u64, HashMap<u16, Vec<SystemTime>>> = HashMap::new();
 
-    for (provider, slots) in data {
+    for (port, slots) in data {
         for (slot, shreds) in slots {
             for timestamp in shreds.values() {
                 slot_provider_times
                     .entry(*slot)
                     .or_default()
-                    .entry(provider.port)
+                    .entry(*port)
                     .or_default()
                     .push(*timestamp);
             }
