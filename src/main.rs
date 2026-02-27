@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         let processor_tx = processor_tx.clone();
         tokio::spawn(async move {
             let mut cleanup_interval = time::interval(Duration::from_secs(config.timeout_secs));
-            let mut stats_interval = time::interval(Duration::from_secs(10));
+            let mut stats_interval = time::interval(Duration::from_secs(60));
 
             loop {
                 tokio::select! {
