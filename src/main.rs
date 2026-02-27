@@ -33,7 +33,7 @@ struct Config {
 struct Args {
     #[clap(short, long)]
     config: String,
-    #[clap(short, long)]
+    #[clap(short, long, default_value_t = false)]
     verbose: bool,
 }
 
