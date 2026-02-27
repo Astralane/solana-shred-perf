@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let rpc = RpcClient::new(config.rpc_url);
     let leader_schedule_cache = fetch_leader_schedule_cache(&rpc).await?;
 
-    let (processor_tx, mut processor_rx) = mpsc::channel(1024 * 100);
+    let (processor_tx, mut processor_rx) = mpsc::channel(1024 * 4);
 
     let primary_provider = config.providers[0].clone();
     let mut tasks = Vec::with_capacity(config.providers.len());
