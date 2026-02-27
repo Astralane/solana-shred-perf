@@ -35,6 +35,8 @@ struct Config {
 struct Args {
     #[clap(short, long)]
     config: String,
+    #[clap(short, long)]
+    verbose: bool,
 }
 
 #[derive(Debug)]
@@ -95,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    let is_verbose = args.verbose;
     let processor_task = tokio::spawn(async move {
         let mut state = ProcessorState {
             ..Default::default()
@@ -129,9 +132,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                     if slot
                         < state
-                            .highest_slot
-                            .load(Ordering::Relaxed)
-                            .saturating_sub(10)
+                        .highest_slot
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(10)
                     {
                         warn!(
                             "skipping, provider sent data 10 slots behind, provider {} highest slot {}, slot recvd {}",
@@ -146,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
                     // cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
                 }
                 ProcessorEvent::StatsTick => {
-                    print_avg_time_diff(primary_provider.port, &state.data);
+                    print_metrics(is_verbose, primary_provider.port, &state.data);
                 }
             }
         }
@@ -218,7 +221,8 @@ fn process_shred(
         .or_insert(timestamp);
 }
 
-fn print_avg_time_diff(
+fn print_metrics(
+    is_verbose: bool,
     primary_port: u16,
     data: &HashMap<u16, HashMap<u64, HashMap<ShredId, SystemTime>>>,
 ) {
@@ -235,12 +239,16 @@ fn print_avg_time_diff(
         }
     };
 
+    let mut total_win_diff = Vec::new();
+    let mut total_loss_diff = Vec::new();
+    let mut only_primary_cnt = 0u64,
+    let mut only_others_cnt = 0u64;
     for slot in &all_slots {
         let primary_shreds = match primary_slots.get(slot) {
             Some(s) => s,
             None => continue,
         };
-        let primairy_shred_keys = primary_shreds.keys().collect::<HashSet<_>>();
+        let primary_shred_keys = primary_shreds.keys().collect::<HashSet<_>>();
 
         for (port, slots) in data {
             if *port == primary_port {
@@ -253,8 +261,10 @@ fn print_avg_time_diff(
 
             let other_shred_keys = other_shreds.keys().collect::<HashSet<_>>();
 
-            let only_primary: Vec<_> = primairy_shred_keys.difference(&other_shred_keys).collect();
-            let only_other: Vec<_> = other_shred_keys.difference(&primairy_shred_keys).collect();
+            let only_primary: Vec<_> = primary_shred_keys.difference(&other_shred_keys).collect();
+            let only_other: Vec<_> = other_shred_keys.difference(&primary_shred_keys).collect();
+            only_others_cnt += only_primary.len() as u64;
+            only_primary_cnt += only_other.len() as u64;
 
             let mut win_diffs: Vec<Duration> = Vec::new();
             let mut lose_diffs: Vec<Duration> = Vec::new();
@@ -268,11 +278,13 @@ fn print_avg_time_diff(
                     // primary arrived first (wins)
                     if let Ok(diff) = other_ts.duration_since(*primary_ts) {
                         win_diffs.push(diff);
+                        total_win_diff.push(diff);
                     }
                 } else {
                     // primary arrived later (loses)
                     if let Ok(diff) = primary_ts.duration_since(*other_ts) {
                         lose_diffs.push(diff);
+                        total_loss_diff.push(diff);
                     }
                 }
             }
@@ -289,12 +301,17 @@ fn print_avg_time_diff(
                 Duration::ZERO
             };
 
-            let win_percent = win_diffs.len() as f64 / (win_diffs.len() as f64 + lose_diffs.len() as f64);
-            let win_percent = win_percent * 100.0;
+            let win_percent = (win_diffs.len() as f64 * 100.0)
+                / (win_diffs.len() as f64 + lose_diffs.len() as f64);
 
+            let loss_percent = (total_loss_diff.len() as f64 * 100.0)
+                / (total_loss_diff.len() + total_win_diff.len()) as f64;
 
+            if !is_verbose {
+                continue;
+            }
             info!(
-                "slot={} | port {} vs port {} | wins={} avg_win={:?} win_percent {:?} | losses={} avg_loss={:?} | only_primary={} | only_other={}",
+                "slot={} | port {} vs port {} | wins={} avg_win={:?} win_percent {:.2} | losses={} avg_loss={:?} loss_percent {:.2} | only_primary={} | only_other={}",
                 slot,
                 primary_port,
                 port,
@@ -303,9 +320,40 @@ fn print_avg_time_diff(
                 win_percent,
                 lose_diffs.len(),
                 avg_lose,
+                loss_percent,
                 only_primary.len(),
                 only_other.len(),
             );
         }
+
+        let avg_win = if !total_win_diff.is_empty() {
+            total_win_diff.iter().sum::<Duration>() / total_win_diff.len() as u32
+        } else {
+            Duration::ZERO
+        };
+        let win_percent = (total_win_diff.len() as f64 * 100.0)
+            / (total_win_diff.len() + total_loss_diff.len()) as f64;
+
+        let avg_lose = if !total_loss_diff.is_empty() {
+            total_loss_diff.iter().sum::<Duration>() / total_loss_diff.len() as u32
+        } else {
+            Duration::ZERO
+        };
+
+        let loss_percent = (total_loss_diff.len() as f64 * 100.0)
+            / (total_loss_diff.len() + total_win_diff.len()) as f64;
+
+        info!(
+            "total | port {} vs others | wins={} avg_win={:?} win_percent {:.2} | losses={} avg_loss={:?} loss_percent {:.2} | only_primary={} | only_other={}",
+            primary_port,
+            total_win_diff.len(),
+            avg_win,
+            win_percent,
+            total_loss_diff.len(),
+            avg_lose,
+            loss_percent,
+            only_primary_cnt,
+            only_others_cnt,
+        )
     }
 }
