@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let rpc = RpcClient::new(config.rpc_url);
     let leader_schedule_cache = fetch_leader_schedule_cache(&rpc).await?;
 
-    let (processor_tx, mut processor_rx) = mpsc::channel(1024 * 4);
+    let (processor_tx, mut processor_rx) = mpsc::unbounded_channel();
 
     let primary_provider = config.providers[0].clone();
     let mut tasks = Vec::with_capacity(config.providers.len());
@@ -74,7 +74,6 @@ async fn main() -> anyhow::Result<()> {
         let provider_c = Arc::new(provider);
         let jh = tokio::spawn(start_port_listener(provider_c, processor_tx.clone()));
         tasks.push(jh)
-
     }
     let listener_tasks = join_all(tasks);
     let timer_task = {
@@ -86,10 +85,10 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::select! {
                     _ = cleanup_interval.tick() => {
-                        processor_tx.send(ProcessorEvent::Cleanup).await.ok();
+                        processor_tx.send(ProcessorEvent::Cleanup).ok();
                     }
                     _ = stats_interval.tick() => {
-                        processor_tx.send(ProcessorEvent::StatsTick).await.ok();
+                        processor_tx.send(ProcessorEvent::StatsTick).ok();
                     }
                 }
             }
@@ -165,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
 
 fn start_port_listener(
     provider: Arc<Provider>,
-    sender: mpsc::Sender<ProcessorEvent>,
+    sender: mpsc::UnboundedSender<ProcessorEvent>,
 ) -> tokio::task::JoinHandle<()> {
     let port = provider.port;
     tokio::spawn(async move {
@@ -192,7 +191,7 @@ fn start_port_listener(
                             timestamp: SystemTime::now(),
                             data: shred,
                         };
-                        if let Err(e) = sender.send(event).await {
+                        if let Err(e) = sender.send(event) {
                             error!("[{}] Failed to send event: {}", provider.name, e);
                         }
                     }
