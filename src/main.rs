@@ -289,13 +289,18 @@ fn print_avg_time_diff(
                 Duration::ZERO
             };
 
+            let win_percent = win_diffs.len() as f64 / (win_diffs.len() as f64 + lose_diffs.len() as f64);
+            let win_percent = win_percent * 100.0;
+
+
             info!(
-                "slot={} | port {} vs port {} | wins={} avg_win={:?} | losses={} avg_loss={:?} | only_primary={} | only_other={}",
+                "slot={} | port {} vs port {} | wins={} avg_win={:?} win_percent {:?} | losses={} avg_loss={:?} | only_primary={} | only_other={}",
                 slot,
                 primary_port,
                 port,
                 win_diffs.len(),
                 avg_win,
+                win_percent,
                 lose_diffs.len(),
                 avg_lose,
                 only_primary.len(),
