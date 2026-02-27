@@ -107,8 +107,8 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         };
 
+        let mut dedup: HashSet<(u16, ShredId)> = HashSet::new();
         while let Some(event) = processor_rx.recv().await {
-            let mut dedup: HashSet<(u16, ShredId)> = HashSet::new();
             match event {
                 ProcessorEvent::ShredReceived {
                     slot,
