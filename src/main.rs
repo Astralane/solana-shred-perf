@@ -72,7 +72,9 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks = Vec::with_capacity(config.providers.len());
     for provider in config.providers {
         let provider_c = Arc::new(provider);
-        tasks.push(start_port_listener(provider_c, processor_tx.clone()))
+        let jh = tokio::spawn(start_port_listener(provider_c, processor_tx.clone()));
+        tasks.push(jh)
+
     }
     let listener_tasks = join_all(tasks);
     let timer_task = {
