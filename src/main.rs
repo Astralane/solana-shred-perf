@@ -241,7 +241,8 @@ fn process_shred<T: io::Write>(
         .or_default()
         .entry(shred.slot())
         .or_default()
-        .insert(shred.id(), timestamp);
+        .entry(shred.id())
+        .or_insert(timestamp);
     // writer
     //     .serialize(Record {
     //         name: provider.name.clone(),
