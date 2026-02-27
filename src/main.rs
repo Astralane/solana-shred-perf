@@ -4,15 +4,14 @@ use crate::leader_schedule_cache::fetch_leader_schedule_cache;
 use clap::Parser;
 use futures_util::future::join_all;
 use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
-use solana_ledger::shred::{Shred, ShredId, ShredType};
+use serde::Deserialize;
+use solana_ledger::shred::{Shred, ShredId};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use std::collections::{HashMap, HashSet};
 use std::fs::read_to_string;
-use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -28,7 +27,6 @@ struct Config {
     pub providers: Vec<Provider>,
     pub rpc_url: String,
     pub timeout_secs: u64,
-    pub csv_file: Option<String>,
 }
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -241,7 +239,7 @@ fn print_metrics(
 
     let mut total_win_diff = Vec::new();
     let mut total_loss_diff = Vec::new();
-    let mut only_primary_cnt = 0u64,
+    let mut only_primary_cnt = 0u64;
     let mut only_others_cnt = 0u64;
     for slot in &all_slots {
         let primary_shreds = match primary_slots.get(slot) {
