@@ -2,7 +2,6 @@ mod leader_schedule_cache;
 
 use crate::leader_schedule_cache::fetch_leader_schedule_cache;
 use clap::Parser;
-use csv::Writer;
 use futures_util::future::join_all;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -74,12 +73,6 @@ async fn main() -> anyhow::Result<()> {
         let now = chrono::Local::now();
         format!("report_{}.csv", now.format("%m_%d_%H_%M_%S"))
     };
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&csv_file_name)?;
-    let mut wtr = csv::Writer::from_writer(file);
 
     let (processor_tx, mut processor_rx) = mpsc::channel(4096);
 
@@ -153,16 +146,14 @@ async fn main() -> anyhow::Result<()> {
                         );
                         continue;
                     }
-                    process_shred(&mut state, &mut wtr, &provider, data, timestamp);
+                    process_shred(&mut state, &provider, data, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
                     // wtr.flush().unwrap();
                     // cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
                 }
                 ProcessorEvent::StatsTick => {
-                    print_shred_coverage(primary_provider.port, &state.data);
                     print_avg_time_diff(primary_provider.port, &state.data);
-                    info!("------");
                 }
             }
         }
@@ -218,19 +209,8 @@ fn start_port_listener(
     })
 }
 
-#[derive(Debug, Serialize)]
-struct Record {
-    name: String,
-    port: u16,
-    slot: u64,
-    shred_index: u32,
-    shred_type: ShredType,
-    ts: u64,
-}
-
-fn process_shred<T: io::Write>(
+fn process_shred(
     state: &mut ProcessorState,
-    writer: &mut Writer<T>,
     provider: &Arc<Provider>,
     shred: Shred,
     timestamp: SystemTime,
@@ -243,28 +223,6 @@ fn process_shred<T: io::Write>(
         .or_default()
         .entry(shred.id())
         .or_insert(timestamp);
-    // writer
-    //     .serialize(Record {
-    //         name: provider.name.clone(),
-    //         port: provider.port,
-    //         slot: shred.slot(),
-    //         shred_index: shred.index(),
-    //         shred_type: ShredType::Data,
-    //         ts: timestamp.duration_since(UNIX_EPOCH).unwrap().as_micros() as u64,
-    //     })
-    //     .unwrap();
-}
-
-fn get_payload(shred: &Shred) -> &[u8] {
-    let Ok(offset) = shred.retransmitter_signature_offset() else {
-        return shred.payload();
-    };
-    // Assert that the retransmitter's signature is at the very end of
-    // the shred payload.
-    shred
-        .payload()
-        .get(..offset)
-        .unwrap_or_else(|| shred.payload())
 }
 
 fn print_avg_time_diff(
@@ -289,6 +247,7 @@ fn print_avg_time_diff(
             Some(s) => s,
             None => continue,
         };
+        let primairy_shred_keys = primary_shreds.keys().collect::<HashSet<_>>();
 
         for (port, slots) in data {
             if *port == primary_port {
@@ -298,6 +257,11 @@ fn print_avg_time_diff(
             let Some(other_shreds) = slots.get(slot) else {
                 continue;
             };
+
+            let other_shred_keys = other_shreds.keys().collect::<HashSet<_>>();
+
+            let only_primary: Vec<_> = primairy_shred_keys.difference(&other_shred_keys).collect();
+            let only_other: Vec<_> = other_shred_keys.difference(&primairy_shred_keys).collect();
 
             let mut win_diffs: Vec<Duration> = Vec::new();
             let mut lose_diffs: Vec<Duration> = Vec::new();
@@ -333,7 +297,7 @@ fn print_avg_time_diff(
             };
 
             info!(
-                "slot={} | port {} vs port {} | wins={} avg_win={:?} | losses={} avg_loss={:?}",
+                "slot={} | port {} vs port {} | wins={} avg_win={:?} | losses={} avg_loss={:?} | only_primary={} | only_other={}",
                 slot,
                 primary_port,
                 port,
@@ -341,48 +305,6 @@ fn print_avg_time_diff(
                 avg_win,
                 lose_diffs.len(),
                 avg_lose,
-            );
-        }
-    }
-}
-
-fn print_shred_coverage(
-    primary_port: u16,
-    data: &HashMap<u16, HashMap<u64, HashMap<ShredId, SystemTime>>>,
-) {
-    let all_slots: std::collections::HashSet<u64> = data
-        .values()
-        .flat_map(|slots| slots.keys().copied())
-        .collect();
-
-    let primary_slots = data.get(&primary_port);
-
-    for slot in &all_slots {
-        let primary_shreds: std::collections::HashSet<&ShredId> = primary_slots
-            .and_then(|s| s.get(slot))
-            .map(|s| s.keys().collect())
-            .unwrap_or_default();
-
-        for (port, slots) in data {
-            if *port == primary_port {
-                continue;
-            }
-
-            let other_shreds: std::collections::HashSet<&ShredId> = slots
-                .get(slot)
-                .map(|s| s.keys().collect())
-                .unwrap_or_default();
-
-            // primary saw it, other didn't
-            let only_primary: Vec<&&ShredId> = primary_shreds.difference(&other_shreds).collect();
-            // other saw it, primary didn't
-            let only_other: Vec<&&ShredId> = other_shreds.difference(&primary_shreds).collect();
-
-            info!(
-                "slot={} | port {} vs port {} | only_primary={} | only_other={}",
-                slot,
-                primary_port,
-                port,
                 only_primary.len(),
                 only_other.len(),
             );
