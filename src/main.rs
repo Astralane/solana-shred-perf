@@ -66,15 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let rpc = RpcClient::new(config.rpc_url);
     let leader_schedule_cache = fetch_leader_schedule_cache(&rpc).await?;
 
-    //create a file from args. csv_file name if exits or create a file with name report_mm_dd_hh_mm_ss format
-    let csv_file_name = if let Some(ref name) = config.csv_file {
-        name.clone()
-    } else {
-        let now = chrono::Local::now();
-        format!("report_{}.csv", now.format("%m_%d_%H_%M_%S"))
-    };
-
-    let (processor_tx, mut processor_rx) = mpsc::channel(4096);
+    let (processor_tx, mut processor_rx) = mpsc::channel(1024 * 100);
 
     let primary_provider = config.providers[0].clone();
     let mut tasks = Vec::with_capacity(config.providers.len());
