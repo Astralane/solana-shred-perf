@@ -8,6 +8,12 @@ log = "0.4"
 pretty_env_logger = "0.5"
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
-clap = {version = "4.2.0", features = ["derive"]}
-solana-ledger = "2.3.4"
+clap = { version = "4.2.0", features = ["derive"] }
+solana-ledger = { git = "https://github.com/Astralane/agave", features = ["agave-unstable-api"] }
 anyhow = "1.0.98"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149" }
+futures-util = { version = "0.3.32" }
+csv = "1.4.0"
+solana-pubkey = "3.0.0"
+solana-rpc-client = "3.1.1"

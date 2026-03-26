@@ -1,102 +1,160 @@
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+mod leader_schedule_cache;
+
+use crate::leader_schedule_cache::fetch_leader_schedule_cache;
 use clap::Parser;
-use log::{info, error};
+use futures_util::future::join_all;
+use log::{error, info, warn};
+use serde::Deserialize;
 use solana_ledger::shred::{Shred, ShredId};
-use tokio::net::UdpSocket;
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use std::collections::{HashMap, HashSet};
+use std::fs::read_to_string;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time;
 
+#[derive(Debug, Clone, Deserialize, Hash)]
+pub struct Provider {
+    pub name: String,
+    pub port: u16,
+}
+
+#[derive(Deserialize, Debug)]
+struct Config {
+    pub providers: Vec<Provider>,
+    pub rpc_url: String,
+    pub timeout_secs: u64,
+}
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    #[clap(long)]
-    pub name_0: String,
-    #[clap(long)]
-    pub port_0: u16,
     #[clap(short, long)]
-    pub name_1: String,
-    #[clap(short, long)]
-    pub port_1: u16,
-    #[clap(long, default_value = "60")]
-    pub timeout_secs: u64,
+    config: String,
+    #[clap(short, long, default_value_t = false)]
+    verbose: bool,
 }
 
 #[derive(Debug)]
 enum ProcessorEvent {
     ShredReceived {
-        port_id: u8,
-        name: Arc<str>,
+        slot: u64,
+        provider: Arc<Provider>,
         shred_id: ShredId,
-        timestamp: Instant,
+        timestamp: SystemTime,
+        data: Shred,
     },
     Cleanup,
     StatsTick,
 }
 
+#[derive(Default)]
 struct ProcessorState {
-    port0_data: HashMap<ShredId, Instant>,
-    port1_data: HashMap<ShredId, Instant>,
-    matched_pairs: usize,
-    delays: Vec<Duration>,
+    data: HashMap<u16, HashMap<u64, HashMap<ShredId, SystemTime>>>,
+    highest_slot: Arc<AtomicU64>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     pretty_env_logger::init();
     let args = Args::parse();
+    let config_file: String = read_to_string(args.config)?;
 
-    let (processor_tx, mut processor_rx) = mpsc::channel(4096);
+    let config: Config = serde_json::from_str(&config_file)?;
+    let rpc = RpcClient::new(config.rpc_url);
+    let leader_schedule_cache = fetch_leader_schedule_cache(&rpc).await?;
 
-    let port0_task = start_port_listener(0, args.name_0.clone().into(), args.port_0, processor_tx.clone());
-    let port1_task = start_port_listener(1, args.name_1.clone().into(), args.port_1, processor_tx.clone());
+    let (processor_tx, mut processor_rx) = mpsc::unbounded_channel();
 
+    let primary_provider = config.providers[0].clone();
+    let mut tasks = Vec::with_capacity(config.providers.len());
+    for provider in config.providers {
+        let provider_c = Arc::new(provider);
+        let jh = tokio::spawn(start_port_listener(provider_c, processor_tx.clone()));
+        tasks.push(jh)
+    }
+    let listener_tasks = join_all(tasks);
     let timer_task = {
         let processor_tx = processor_tx.clone();
         tokio::spawn(async move {
-            let mut cleanup_interval = time::interval(Duration::from_secs(args.timeout_secs));
-            let mut stats_interval = time::interval(Duration::from_secs(10));
+            let mut cleanup_interval = time::interval(Duration::from_secs(config.timeout_secs));
+            let mut stats_interval = time::interval(Duration::from_secs(60));
 
             loop {
                 tokio::select! {
                     _ = cleanup_interval.tick() => {
-                        processor_tx.send(ProcessorEvent::Cleanup).await.ok();
+                        processor_tx.send(ProcessorEvent::Cleanup).ok();
                     }
                     _ = stats_interval.tick() => {
-                        processor_tx.send(ProcessorEvent::StatsTick).await.ok();
+                        processor_tx.send(ProcessorEvent::StatsTick).ok();
                     }
                 }
             }
         })
     };
 
+    let is_verbose = args.verbose;
     let processor_task = tokio::spawn(async move {
         let mut state = ProcessorState {
-            port0_data: HashMap::new(),
-            port1_data: HashMap::new(),
-            matched_pairs: 0,
-            delays: Vec::new(),
+            ..Default::default()
         };
 
+        let mut dedup: HashSet<(u16, ShredId)> = HashSet::new();
         while let Some(event) = processor_rx.recv().await {
             match event {
-                ProcessorEvent::ShredReceived { port_id, name,shred_id, timestamp } => {
-                    process_shred(&mut state, port_id, name, shred_id, timestamp);
+                ProcessorEvent::ShredReceived {
+                    slot,
+                    provider,
+                    shred_id,
+                    timestamp,
+                    data,
+                } => {
+                    let leader = leader_schedule_cache
+                        .get(&slot)
+                        .expect("slot not in schedule");
+
+                    if !data.verify(leader) {
+                        warn!(
+                            "cannot verify shreds given by provider {:?} for {slot} {leader:?}",
+                            provider.name
+                        )
+                    }
+                    if dedup.contains(&(provider.port, shred_id)) {
+                        continue;
+                    }
+                    dedup.insert((provider.port, shred_id));
+                    if slot > state.highest_slot.load(Ordering::Relaxed) {
+                        state.highest_slot.store(slot, Ordering::Relaxed);
+                    }
+                    if slot
+                        < state
+                        .highest_slot
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(10)
+                    {
+                        warn!(
+                            "skipping, provider sent data 10 slots behind, provider {} highest slot {}, slot recvd {}",
+                            provider.name, state.highest_slot.load(Ordering::Relaxed), slot
+                        );
+                        continue;
+                    }
+                    process_shred(&mut state, &provider, data, timestamp);
                 }
                 ProcessorEvent::Cleanup => {
-                    cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
+                    // wtr.flush().unwrap();
+                    // cleanup_data(&mut state, Duration::from_secs(args.timeout_secs));
                 }
                 ProcessorEvent::StatsTick => {
-                    report_stats(&state, &args);
+                    print_metrics(is_verbose, primary_provider.port, &state.data);
                 }
             }
         }
     });
 
     tokio::select! {
-        _ = port0_task => {},
-        _ = port1_task => {},
+        _ = listener_tasks => {},
         _ = processor_task => {},
         _ = timer_task => {},
         _ = tokio::signal::ctrl_c() => info!("Shutting down..."),
@@ -106,20 +164,19 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn start_port_listener(
-    port_id: u8,
-    name: Arc<str>,
-    port: u16,
-    sender: mpsc::Sender<ProcessorEvent>,
+    provider: Arc<Provider>,
+    sender: mpsc::UnboundedSender<ProcessorEvent>,
 ) -> tokio::task::JoinHandle<()> {
+    let port = provider.port;
     tokio::spawn(async move {
         let socket = match UdpSocket::bind(format!("0.0.0.0:{}", port)).await {
             Ok(s) => s,
             Err(e) => {
-                error!("[{}] Failed to bind port {}: {}", name, port, e);
+                error!("[{}] Failed to bind port {}: {}", provider.name, port, e);
                 return;
             }
         };
-        info!("[{}] Listening on port {}", name, port);
+        info!("[{}] Listening on port {}", provider.name, port);
 
         let mut buf = [0u8; 2048];
         loop {
@@ -127,74 +184,174 @@ fn start_port_listener(
                 Ok((size, _)) => {
                     let data = buf[..size].to_vec();
                     if let Ok(shred) = Shred::new_from_serialized_shred(data) {
+                        let slot = shred.slot() as u64;
                         let event = ProcessorEvent::ShredReceived {
-                            port_id,
-                            name: Arc::clone(&name),
+                            slot,
+                            provider: provider.clone(),
                             shred_id: shred.id(),
-                            timestamp: Instant::now(),
+                            timestamp: SystemTime::now(),
+                            data: shred,
                         };
-                        if let Err(e) = sender.send(event).await {
-                            error!("[{}] Failed to send event: {}", name, e);
+                        if let Err(e) = sender.send(event) {
+                            error!("[{}] Failed to send event: {}", provider.name, e);
                         }
                     }
                 }
-                Err(e) => error!("[{}] Receive error: {}", name, e),
+                Err(e) => error!("[{}] Receive error: {}", provider.name, e),
             }
         }
     })
 }
 
-fn process_shred(state: &mut ProcessorState, port_id: u8, name: Arc<str>, shred_id: ShredId, timestamp: Instant) {
-    match port_id {
-        0 => {
-            if state.port0_data.contains_key(&shred_id) {
-                return;
-            }
-            state.port0_data.insert(shred_id.clone(), timestamp);
-            if let Some(other_time) = state.port1_data.get(&shred_id) {
-                let delay = timestamp.duration_since(*other_time);
-                state.matched_pairs += 1;
-                state.delays.push(delay);
-                info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
-            }
-        }
-        1 => {
-            if state.port1_data.contains_key(&shred_id) {
-                return;
-            }
-            state.port1_data.insert(shred_id.clone(), timestamp);
-            if let Some(other_time) = state.port0_data.get(&shred_id) {
-                let delay = timestamp.duration_since(*other_time);
-                state.matched_pairs += 1;
-                state.delays.push(delay);
-                info!("{}: Shred {:?} delay: {:?}", name, shred_id, delay);
-            }
-        }
-        _ => unreachable!(),
-    }
+fn process_shred(
+    state: &mut ProcessorState,
+    provider: &Arc<Provider>,
+    shred: Shred,
+    timestamp: SystemTime,
+) {
+    state
+        .data
+        .entry(provider.port)
+        .or_default()
+        .entry(shred.slot())
+        .or_default()
+        .entry(shred.id())
+        .or_insert(timestamp);
 }
 
-fn cleanup_data(state: &mut ProcessorState, timeout: Duration) {
-    let now = Instant::now();
-    state.port0_data.retain(|_, t| now.duration_since(*t) < timeout);
-    state.port1_data.retain(|_, t| now.duration_since(*t) < timeout);
-    info!("Cleanup completed");
-}
+fn print_metrics(
+    is_verbose: bool,
+    primary_port: u16,
+    data: &HashMap<u16, HashMap<u64, HashMap<ShredId, SystemTime>>>,
+) {
+    let all_slots: std::collections::HashSet<u64> = data
+        .values()
+        .flat_map(|slots| slots.keys().copied())
+        .collect();
 
-fn report_stats(state: &ProcessorState, args: &Args) {
-    let avg_delay = if !state.delays.is_empty() {
-        state.delays.iter().sum::<Duration>() / state.delays.len() as u32
-    } else {
-        Duration::ZERO
+    let primary_slots = match data.get(&primary_port) {
+        Some(s) => s,
+        None => {
+            error!("primary port {} not found", primary_port);
+            return;
+        }
     };
 
-    info!(
-        "Stats: Port {}: {} | Port {}: {} | Matched: {} | Avg delay: {:?}",
-        args.name_0,
-        state.port0_data.len(),
-        args.name_1,
-        state.port1_data.len(),
-        state.matched_pairs,
-        avg_delay
-    );
+    let mut total_win_diff = Vec::new();
+    let mut total_loss_diff = Vec::new();
+    let mut only_primary_cnt = 0u64;
+    let mut only_others_cnt = 0u64;
+    for slot in &all_slots {
+        let primary_shreds = match primary_slots.get(slot) {
+            Some(s) => s,
+            None => continue,
+        };
+        let primary_shred_keys = primary_shreds.keys().collect::<HashSet<_>>();
+
+        for (port, slots) in data {
+            if *port == primary_port {
+                continue;
+            }
+
+            let Some(other_shreds) = slots.get(slot) else {
+                continue;
+            };
+
+            let other_shred_keys = other_shreds.keys().collect::<HashSet<_>>();
+
+            let only_primary: Vec<_> = primary_shred_keys.difference(&other_shred_keys).collect();
+            let only_other: Vec<_> = other_shred_keys.difference(&primary_shred_keys).collect();
+            only_others_cnt += only_primary.len() as u64;
+            only_primary_cnt += only_other.len() as u64;
+
+            let mut win_diffs: Vec<Duration> = Vec::new();
+            let mut lose_diffs: Vec<Duration> = Vec::new();
+
+            for (shred_id, primary_ts) in primary_shreds {
+                let Some(other_ts) = other_shreds.get(shred_id) else {
+                    continue;
+                };
+
+                if primary_ts <= other_ts {
+                    // primary arrived first (wins)
+                    if let Ok(diff) = other_ts.duration_since(*primary_ts) {
+                        win_diffs.push(diff);
+                        total_win_diff.push(diff);
+                    }
+                } else {
+                    // primary arrived later (loses)
+                    if let Ok(diff) = primary_ts.duration_since(*other_ts) {
+                        lose_diffs.push(diff);
+                        total_loss_diff.push(diff);
+                    }
+                }
+            }
+
+            let avg_win = if !win_diffs.is_empty() {
+                win_diffs.iter().sum::<Duration>() / win_diffs.len() as u32
+            } else {
+                Duration::ZERO
+            };
+
+            let avg_lose = if !lose_diffs.is_empty() {
+                lose_diffs.iter().sum::<Duration>() / lose_diffs.len() as u32
+            } else {
+                Duration::ZERO
+            };
+
+            let win_percent = (win_diffs.len() as f64 * 100.0)
+                / (win_diffs.len() as f64 + lose_diffs.len() as f64);
+
+            let loss_percent = (total_loss_diff.len() as f64 * 100.0)
+                / (total_loss_diff.len() + total_win_diff.len()) as f64;
+
+            if !is_verbose {
+                continue;
+            }
+            info!(
+                "slot={} | port {} vs port {} | wins={} avg_win={:?} win_percent {:.2} | losses={} avg_loss={:?} loss_percent {:.2} | only_primary={} | only_other={}",
+                slot,
+                primary_port,
+                port,
+                win_diffs.len(),
+                avg_win,
+                win_percent,
+                lose_diffs.len(),
+                avg_lose,
+                loss_percent,
+                only_primary.len(),
+                only_other.len(),
+            );
+        }
+
+        let avg_win = if !total_win_diff.is_empty() {
+            total_win_diff.iter().sum::<Duration>() / total_win_diff.len() as u32
+        } else {
+            Duration::ZERO
+        };
+        let win_percent = (total_win_diff.len() as f64 * 100.0)
+            / (total_win_diff.len() + total_loss_diff.len()) as f64;
+
+        let avg_lose = if !total_loss_diff.is_empty() {
+            total_loss_diff.iter().sum::<Duration>() / total_loss_diff.len() as u32
+        } else {
+            Duration::ZERO
+        };
+
+        let loss_percent = (total_loss_diff.len() as f64 * 100.0)
+            / (total_loss_diff.len() + total_win_diff.len()) as f64;
+
+        info!(
+            "total | port {} vs others | wins={} avg_win={:?} win_percent {:.2} | losses={} avg_loss={:?} loss_percent {:.2} | only_primary={} | only_other={}",
+            primary_port,
+            total_win_diff.len(),
+            avg_win,
+            win_percent,
+            total_loss_diff.len(),
+            avg_lose,
+            loss_percent,
+            only_primary_cnt,
+            only_others_cnt,
+        )
+    }
 }
